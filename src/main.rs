@@ -21,6 +21,7 @@ async fn main() {
             let (reader, mut writer) = socket.split();
             let mut reader = BufReader::new(reader);
             let mut line = String::new();
+            let name = address;
 
             // for more than 1 message
             loop {
@@ -32,7 +33,8 @@ async fn main() {
                             break;
                         }
 
-                        tx.send((line.clone(), address)).unwrap();
+                        let msg = line.clone();
+                        tx.send((format!("({name}): {line}"), address)).unwrap();
                         line.clear();
                     }
                     other_msg = rx.recv() => {
