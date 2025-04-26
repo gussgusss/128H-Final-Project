@@ -116,8 +116,8 @@ async fn handle_user(
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
     let mut name: String = "Guest".to_string();
-    let room_name = "main";
-    let room_tx = rooms.join(room_name);
+    let mut room_name = "main".to_owned();
+    let mut room_tx = rooms.join(&room_name);
     let mut room_rx = room_tx.subscribe();
 
     writer
@@ -152,6 +152,19 @@ async fn handle_user(
                         writer.flush().await.unwrap();
                     }
                     line.clear();
+                } else if (line.starts_with("/join")) {
+                    let new_room = line[6..].trim().to_string().to_owned();
+                    if (new_room != room_name) {
+                        let _ = room_tx.send(format!("📢: {name} has left {room_name}\n"));
+                        room_name = new_room;
+                        room_tx = rooms.join(&room_name);
+                        room_rx = room_tx.subscribe();
+                        let _ = room_tx.send(format!("📢: {name} has joined {room_name}\n"));
+                    } else {
+                        writer.write_all(format!("📢: You are already in {room_name}\n").as_bytes()).await.unwrap();
+                        writer.flush().await.unwrap();
+                    }
+
                 } else if (line.trim_end() == "/quit"){
                     break;
 
