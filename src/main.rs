@@ -24,6 +24,10 @@ impl Names {
     fn insert(&self, name: String) -> bool {
         self.0.lock().unwrap().insert(name)
     }
+
+    fn remove(&self, name: &str) -> bool {
+        self.0.lock().unwrap().remove(name)
+    }
 }
 
 #[tokio::main]
@@ -75,9 +79,11 @@ async fn handle_client(
                     //disconnect
                     break;
                 } else if (line.starts_with("/name ")) {
+
                     let new_name = line[6..].trim().to_string();
                     let name_changed = names.insert(new_name.clone());
                     if (name_changed) {
+                        names.remove(&name);
                         tx.send((format!("❗: {name} is now {new_name}\n"), address)).unwrap();
                         name = new_name;
                         writer.write_all(format!("❗: Your name is now {name}\n").as_bytes()).await.unwrap();
@@ -106,4 +112,5 @@ async fn handle_client(
             }
         }
     }
+    names.remove(&name);
 }
