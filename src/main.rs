@@ -1,188 +1,154 @@
-use std::{
-    collections::{HashMap, HashSet},
-    net::SocketAddr,
-    sync::{Arc, Mutex, RwLock},
-};
+mod server;
 
+use eframe::{
+    egui::{self, FontId, Key, TopBottomPanel, Vec2, ViewportBuilder},
+    App, Frame, NativeOptions,
+};
+use std::net::SocketAddr;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter},
-    net::{TcpListener, TcpStream},
-    sync::broadcast::{self, Receiver, Sender},
+    net::TcpStream,
+    runtime::Runtime,
+    sync::mpsc::{self, Receiver, Sender},
 };
 
-#[derive(Clone)]
-//arc can share ownership
-//mutex makes sure only one thread can change data at a time
-struct Names(Arc<Mutex<HashSet<String>>>);
-
-impl Names {
-    fn new() -> Self {
-        Self(Arc::new(Mutex::new(HashSet::new())))
-    }
-
-    // inserts name. returns false if dupe
-    fn insert(&self, name: String) -> bool {
-        self.0.lock().unwrap().insert(name)
-    }
-
-    fn remove(&self, name: &str) -> bool {
-        self.0.lock().unwrap().remove(name)
-    }
-}
-
-struct Room {
-    tx: Sender<String>,
-}
-
-impl Room {
-    fn new() -> Self {
-        let (tx, _) = broadcast::channel(10);
-        Self { tx }
-    }
-}
-
-const MAIN: &str = "main";
-
-#[derive(Clone)]
-// rwlock allows multiple readers or one writer
-struct Rooms(Arc<RwLock<HashMap<String, Room>>>);
-
-impl Rooms {
-    fn new() -> Self {
-        Self(Arc::new(RwLock::new(HashMap::new())))
-    }
-
-    fn join(&self, room_name: &str) -> Sender<String> {
-        // get read access
-        let read_guard = self.0.read().unwrap();
-        // check if room already exists. if yes, returns its sender
-        if let Some(room) = read_guard.get(room_name) {
-            return room.tx.clone();
+fn main() -> Result<(), eframe::Error> {
+    //  the chat server in the background
+    let mut rt_main = Runtime::new().unwrap();
+    rt_main.spawn(async {
+        if let Err(e) = server::run_server().await {
+            eprintln!("Server error: {}", e);
+            std::process::exit(1);
         }
-        // must drop read before acquiring write
-        drop(read_guard);
+    });
+    // launch egui window
+    let addr: SocketAddr = "127.0.0.1:4040".parse().unwrap();
 
-        // get write access and create new room, returning sender
-        let mut write_guard = self.0.write().unwrap();
-        write_guard.insert(room_name.to_owned(), Room::new());
-        let room = write_guard.get(room_name).unwrap();
-        room.tx.clone()
-    }
+    eframe::run_native(
+        "Chat Server",
+        NativeOptions::default(),
+        Box::new(move |cc| Box::new(ChatApp::new(cc, addr))),
+    )
 }
 
-#[tokio::main]
-async fn main() {
-    let listener = TcpListener::bind("localhost:4040").await.unwrap();
-    let (tx, _) = broadcast::channel(10);
-    let names = Names::new();
-    let rooms = Rooms::new();
-
-    accept_loop(listener, tx, names, rooms).await;
+struct ChatApp {
+    messages: Vec<String>,
+    input: String,
+    tx_write: Sender<String>,
+    rx_read: Receiver<String>,
+    rt: Runtime,
 }
 
-// ensures multiple users can connect
-async fn accept_loop(
-    listener: TcpListener,
-    tx: Sender<(String, SocketAddr)>,
-    names: Names,
-    rooms: Rooms,
-) {
-    loop {
-        let (socket, address) = listener.accept().await.unwrap();
-        let tx_clone = tx.clone();
-        let rx = tx.subscribe();
+impl ChatApp {
+    pub fn new(_cc: &eframe::CreationContext<'_>, addr: SocketAddr) -> Self {
+        let rt = Runtime::new().unwrap();
+        //dark theme
+        _cc.egui_ctx.set_visuals(egui::Visuals::dark());
 
-        // spawns an async thread for each user
-        tokio::spawn(handle_user(
-            socket,
-            address,
-            tx_clone,
-            rx,
-            names.clone(),
-            rooms.clone(),
-        ));
-    }
-}
+        let (tx_read, rx_read) = mpsc::channel::<String>(100);
 
-async fn handle_user(
-    mut socket: TcpStream,
-    address: SocketAddr,
-    tx: Sender<(String, SocketAddr)>,
-    mut rx: Receiver<(String, SocketAddr)>,
-    names: Names,
-    rooms: Rooms,
-) {
-    let (reader, mut writer) = socket.split();
-    let mut reader = BufReader::new(reader);
-    let mut line = String::new();
-    let mut name: String = "Guest".to_string();
-    let mut room_name = "main".to_owned();
-    let mut room_tx = rooms.join(&room_name);
-    let mut room_rx = room_tx.subscribe();
+        let (tx_write, mut rx_write) = mpsc::channel::<String>(100);
 
-    writer
-        .write_all(format!("📢: Your name is {name}\n").as_bytes())
-        .await
-        .unwrap();
-    writer.flush().await.unwrap();
+        // spawns an async block to manage the socket
+        rt.spawn(async move {
+            let stream = TcpStream::connect(addr).await.unwrap();
+            let (r, w) = stream.into_split();
+            let mut reader = BufReader::new(r);
+            let mut writer = BufWriter::new(w);
 
-    let _ = room_tx.send(format!("📢: {name} has joined {room_name}\n"));
-
-    // loop for 1< message
-    loop {
-        // returns first branch that finishes - user sends msg / receiving msg from other user
-        tokio::select! {
-            // when this user sends msg
-            user_msg = reader.read_line(&mut line) => {
-                if user_msg.unwrap() == 0 {
-                    //disconnect
-                    break;
-                } else if (line.starts_with("/name ")) {
-
-                    let new_name = line[6..].trim().to_string();
-                    let name_changed = names.insert(new_name.clone());
-                    if (name_changed) {
-                        names.remove(&name);
-                        tx.send((format!("📢: {name} is now {new_name}\n"), address)).unwrap();
-                        name = new_name;
-                        writer.write_all(format!("📢: Your name is now {name}\n").as_bytes()).await.unwrap();
-                        writer.flush().await.unwrap();
-                    } else {
-                        writer.write_all(format!("📢: The name {new_name} has already been taken, please choose a new one.\n").as_bytes()).await.unwrap();
-                        writer.flush().await.unwrap();
+            // read messages from server
+            let mut buf = String::new();
+            let tx_read_clone = tx_read.clone();
+            tokio::spawn(async move {
+                loop {
+                    buf.clear();
+                    let n = reader.read_line(&mut buf).await.unwrap_or(0);
+                    if (n == 0) {
+                        break;
                     }
-                    line.clear();
-                } else if (line.starts_with("/join")) {
-                    let new_room = line[6..].trim().to_string().to_owned();
-                    if (new_room != room_name) {
-                        let _ = room_tx.send(format!("📢: {name} has left {room_name}\n"));
-                        room_name = new_room;
-                        room_tx = rooms.join(&room_name);
-                        room_rx = room_tx.subscribe();
-                        let _ = room_tx.send(format!("📢: {name} has joined {room_name}\n"));
-                    } else {
-                        writer.write_all(format!("📢: You are already in {room_name}\n").as_bytes()).await.unwrap();
-                        writer.flush().await.unwrap();
-                    }
-
-                } else if (line.trim_end() == "/quit"){
-                    break;
-
-                } else {
-                    room_tx.send(format!("({name}): {line}")).unwrap();
-                    line.clear();
+                    let line = buf.trim_end().to_owned();
+                    let _ = tx_read_clone.send(line).await;
                 }
-            }
+            });
 
-            // when any broadcast arrives
-            other_msg = room_rx.recv() => {
-                let msg = other_msg.unwrap();
-                // doesn't show the message if it has the user's address
+            // send messages to server
+            tokio::spawn(async move {
+                while let Some(msg) = rx_write.recv().await {
+                    if (writer.write_all(msg.as_bytes()).await.is_err()) {
+                        break;
+                    }
+                    let _ = writer.write_all(b"\n").await;
+                    let _ = writer.flush().await;
+                }
+            });
+        });
 
-                    writer.write_all(msg.as_bytes()).await.unwrap();
-
-            }
+        Self {
+            messages: Vec::new(),
+            input: String::new(),
+            tx_write,
+            rx_read,
+            rt,
         }
     }
-    names.remove(&name);
+}
+
+impl App for ChatApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut Frame) {
+        // keeps checking for messages and appending to array
+        while let Ok(msg) = self.rx_read.try_recv() {
+            self.messages.push(msg);
+        }
+
+        // build UI
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.vertical(|ui| {
+                // scrollable chat
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false; 2])
+                    .show(ui, |ui| {
+                        for m in &self.messages {
+                            ui.label(
+                                egui::RichText::new(m)
+                                    .font(FontId::new(20.0, egui::FontFamily::Monospace)),
+                            );
+                        }
+                    });
+
+                ui.add_space(10.0);
+
+                // text input at the bottom
+                TopBottomPanel::bottom("input_panel").show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        // single line text edit
+                        let text_edit = egui::TextEdit::singleline(&mut self.input)
+                            .hint_text("Type a message…")
+                            .frame(true)
+                            .desired_width(f32::INFINITY)
+                            .font(FontId::new(20.0, egui::FontFamily::Monospace))
+                            .lock_focus(false);
+                        let response = ui.add(text_edit);
+
+                        // sends the message to server when enter is pressed
+                        if ui.input(|i| i.key_pressed(Key::Enter)) {
+                            if !self.input.trim().is_empty() {
+                                let msg = self.input.trim().to_owned();
+                                self.input.clear();
+                                let mut tx = self.tx_write.clone();
+                                self.rt.spawn(async move {
+                                    let _ = tx.send(msg).await;
+                                });
+                            }
+
+                            // refocusing onto text edit
+                            response.request_focus();
+                        }
+                    });
+                });
+            });
+        });
+
+        // keeps UI responsive
+        ctx.request_repaint();
+    }
 }
